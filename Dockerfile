@@ -1,67 +1,33 @@
-FROM node:24 AS webui-builder
-
-WORKDIR /app/webui
-COPY webui/package.json webui/package-lock.json ./
-RUN npm ci
-COPY config.example.json /app/config.example.json
-COPY webui ./
-RUN npm run build
-
+# === 第一阶段：构建 Go 二进制 ===
 FROM golang:1.26 AS go-builder
 WORKDIR /app
-ARG TARGETOS
-ARG TARGETARCH
-ARG BUILD_VERSION
-COPY go.mod go.sum* ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN set -eux; \
-    GOOS="${TARGETOS:-$(go env GOOS)}"; \
-    GOARCH="${TARGETARCH:-$(go env GOARCH)}"; \
-    BUILD_VERSION_RESOLVED="${BUILD_VERSION:-}"; \
-    if [ -z "${BUILD_VERSION_RESOLVED}" ] && [ -f VERSION ]; then BUILD_VERSION_RESOLVED="$(cat VERSION | tr -d "[:space:]")"; fi; \
-    CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" go build -ldflags="-s -w -X ds2api/internal/version.BuildVersion=${BUILD_VERSION_RESOLVED}" -o /out/ds2api ./cmd/ds2api
+# 如果入口在根目录，直接 build .；否则改成 ./cmd/xxx
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/ds2api .
 
-FROM busybox:1.36.1-musl AS busybox-tools
+# === 第二阶段：构建 WebUI（可选） ===
+FROM node:20-alpine AS webui-builder
+WORKDIR /webui
+COPY webui/package*.json ./
+RUN npm ci
+COPY webui/ .
+RUN npm run build
 
-FROM debian:bookworm-slim AS runtime-base
+# === 第三阶段：运行时镜像 ===
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=busybox-tools /bin/busybox /usr/local/bin/busybox
+
+# 复制 Go 程序
+COPY --from=go-builder /out/ds2api .
+# 复制预编译的前端（如果生成了 dist）
+COPY --from=webui-builder /webui/dist ./webui/dist
+# 复制一个默认的 config.json（避免挂载目录问题）
+COPY config.json ./config.json
+
+# 入口脚本可选，若需要动态设置环境变量等
 EXPOSE 5001
-CMD ["/usr/local/bin/ds2api"]
-
-FROM runtime-base AS runtime-from-source
-COPY --from=go-builder /out/ds2api /usr/local/bin/ds2api
-
-COPY --from=go-builder /app/config.example.json /app/config.example.json
-COPY --from=webui-builder /app/static/admin /app/static/admin
-
-FROM busybox-tools AS dist-extract
-ARG TARGETARCH
-COPY dist/docker-input/linux_amd64.tar.gz /tmp/ds2api_linux_amd64.tar.gz
-COPY dist/docker-input/linux_arm64.tar.gz /tmp/ds2api_linux_arm64.tar.gz
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) ARCHIVE="/tmp/ds2api_linux_amd64.tar.gz" ;; \
-      arm64) ARCHIVE="/tmp/ds2api_linux_arm64.tar.gz" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    tar -xzf "${ARCHIVE}" -C /tmp; \
-    PKG_DIR="$(find /tmp -maxdepth 1 -type d -name "ds2api_*_linux_${TARGETARCH}" | head -n1)"; \
-    test -n "${PKG_DIR}"; \
-    mkdir -p /out/static; \
-    cp "${PKG_DIR}/ds2api" /out/ds2api; \
-
-    cp "${PKG_DIR}/config.example.json" /out/config.example.json; \
-    cp -R "${PKG_DIR}/static/admin" /out/static/admin
-
-FROM runtime-base AS runtime-from-dist
-COPY --from=dist-extract /out/ds2api /usr/local/bin/ds2api
-
-COPY --from=dist-extract /out/config.example.json /app/config.example.json
-COPY --from=dist-extract /out/static/admin /app/static/admin
-
-FROM runtime-from-source AS final
+CMD ["./ds2api"]
